@@ -42,7 +42,7 @@ async function checkAndRecordPerson(merchantId, personId) {
     db.query(
       'UPDATE person_visit SET last_seen_at = ?, visit_count = visit_count + 1 WHERE merchant_id = ? AND person_id = ?',
       [now, merchantId, personId]
-    ).catch(() => {});
+    ).catch(err => console.error('[Worker] person_visit update failed:', err.message));
     return { isNew: false };
   }
 
@@ -58,7 +58,7 @@ async function checkAndRecordPerson(merchantId, personId) {
     db.query(
       'UPDATE person_visit SET last_seen_at = ?, visit_count = visit_count + 1 WHERE merchant_id = ? AND person_id = ?',
       [now, merchantId, personId]
-    ).catch(() => {});
+    ).catch(err => console.error('[Worker] person_visit update failed:', err.message));
     return { isNew: false };
   }
 
