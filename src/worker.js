@@ -5,7 +5,8 @@ const { parseAttributes, toTimeBucket } = require('./parser');
 const QUEUE_KEY    = process.env.QUEUE_KEY    || 'traffic:upload:queue';
 const IDLE_MS      = parseInt(process.env.WORKER_IDLE_MS || '500');
 const CACHE_PREFIX = 'traffic:realtime:';
-const BIND_CACHE   = 'traffic:bindid:';  // bindId → merchantId, TTL 10 min
+const BIND_CACHE   = 'traffic:bindid:';   // bindId → merchantId, TTL 10 min
+const PERSON_CACHE = 'traffic:person:';   // merchant:personId → seen flag, TTL 1 year
 
 let running = false;
 
@@ -27,9 +28,52 @@ async function getMerchantId(bindId) {
   return merchantId;
 }
 
+// ── 判断是否新客，并更新 person_visit 记录 ───────────────────────────────
+// 用 Redis 做一级缓存（TTL 1年），DB 做持久化，避免每次都查库
+async function checkAndRecordPerson(merchantId, personId) {
+  if (!personId) return { isNew: false };
+
+  const key = `${PERSON_CACHE}${merchantId}:${personId}`;
+  const cached = await redis.get(key);
+  const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+
+  if (cached) {
+    // 已见过，更新最近到访时间（异步，不阻塞主流程）
+    db.query(
+      'UPDATE person_visit SET last_seen_at = ?, visit_count = visit_count + 1 WHERE merchant_id = ? AND person_id = ?',
+      [now, merchantId, personId]
+    ).catch(() => {});
+    return { isNew: false };
+  }
+
+  // Redis 未命中，查 DB
+  const [rows] = await db.query(
+    'SELECT 1 FROM person_visit WHERE merchant_id = ? AND person_id = ? LIMIT 1',
+    [merchantId, personId]
+  );
+
+  if (rows.length > 0) {
+    // 回头客，补写 Redis 缓存
+    await redis.set(key, '1', 'EX', 86400 * 365);
+    db.query(
+      'UPDATE person_visit SET last_seen_at = ?, visit_count = visit_count + 1 WHERE merchant_id = ? AND person_id = ?',
+      [now, merchantId, personId]
+    ).catch(() => {});
+    return { isNew: false };
+  }
+
+  // 新客，写入 DB + Redis
+  await db.query(
+    'INSERT INTO person_visit (merchant_id, person_id, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)',
+    [merchantId, personId, now, now]
+  );
+  await redis.set(key, '1', 'EX', 86400 * 365);
+  return { isNew: true };
+}
+
 // ── Upsert one detection into traffic_fact ────────────────────────────────
 async function upsertDetection(merchantId, detection) {
-  const { deviceId, entryTime, exitTime, entryCount, isPassThrough, attributes } = detection;
+  const { personId, deviceId, entryTime, exitTime, entryCount, isPassThrough, attributes } = detection;
 
   const timeBucket = toTimeBucket(entryTime || new Date());
   const parsed = parseAttributes(attributes);
@@ -56,6 +100,13 @@ async function upsertDetection(merchantId, detection) {
   const enter = isPassThrough ? 0 : (entryCount || 1);
   const pass  = isPassThrough ? (entryCount || 1) : 0;
 
+  // 新客/回头客判断（穿行不计入）
+  let newCustomer = 0, returningCustomer = 0;
+  if (!isPassThrough && enter > 0) {
+    const { isNew } = await checkAndRecordPerson(merchantId, personId);
+    if (isNew) newCustomer = 1; else returningCustomer = 1;
+  }
+
   await db.query(`
     INSERT INTO traffic_fact
       (merchant_id, device_id, time_bucket,
@@ -69,7 +120,8 @@ async function upsertDetection(merchantId, detection) {
        lower_trousers, lower_shorts, lower_skirt,
        lower_style_stripe, lower_style_pattern,
        total_stay_seconds, stay_count,
-       stay_under5min, stay_5to15min, stay_over15min)
+       stay_under5min, stay_5to15min, stay_over15min,
+       new_customer_count, returning_customer_count)
     VALUES
       (?, ?, ?,
        ?, ?,
@@ -82,7 +134,8 @@ async function upsertDetection(merchantId, detection) {
        ?, ?, ?,
        ?, ?,
        ?, ?,
-       ?, ?, ?)
+       ?, ?, ?,
+       ?, ?)
     ON DUPLICATE KEY UPDATE
        enter_count          = enter_count          + VALUES(enter_count),
        pass_count           = pass_count           + VALUES(pass_count),
@@ -112,9 +165,11 @@ async function upsertDetection(merchantId, detection) {
        lower_style_pattern  = lower_style_pattern  + VALUES(lower_style_pattern),
        total_stay_seconds   = total_stay_seconds   + VALUES(total_stay_seconds),
        stay_count           = stay_count           + VALUES(stay_count),
-       stay_under5min       = stay_under5min       + VALUES(stay_under5min),
-       stay_5to15min        = stay_5to15min        + VALUES(stay_5to15min),
-       stay_over15min       = stay_over15min       + VALUES(stay_over15min)
+       stay_under5min          = stay_under5min          + VALUES(stay_under5min),
+       stay_5to15min           = stay_5to15min           + VALUES(stay_5to15min),
+       stay_over15min          = stay_over15min          + VALUES(stay_over15min),
+       new_customer_count      = new_customer_count      + VALUES(new_customer_count),
+       returning_customer_count = returning_customer_count + VALUES(returning_customer_count)
   `, [
     merchantId, deviceId, timeBucket,
     enter, pass,
@@ -128,6 +183,7 @@ async function upsertDetection(merchantId, detection) {
     parsed.lower_style_stripe, parsed.lower_style_pattern,
     staySeconds, stayCount,
     under5, mid5to15, over15,
+    newCustomer, returningCustomer,
   ]);
 }
 
