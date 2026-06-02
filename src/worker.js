@@ -254,6 +254,7 @@ async function processOne(payload) {
   }
   await upsertDetection(merchantId, detection);
   await refreshRealtimeCache(merchantId);
+  console.log(`[Worker] ok bindId=${bindId} merchantId=${merchantId} personId=${detection.personId} deviceId=${detection.deviceId}`);
 }
 
 async function start() {

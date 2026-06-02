@@ -26,7 +26,9 @@ app.post('/upload', async (req, res) => {
   const err = validate(req.body);
   if (err) return res.status(400).json({ code: 400, message: err });
 
-  const { bindId, personDetections } = req.body;
+  const { systemId, bindId, personDetections } = req.body;
+
+  console.log(`[Server] recv systemId=${systemId} bindId=${bindId || 'none'} detections=${personDetections.length}`);
 
   // Push each detection as a separate queue item so the worker
   // can process them one at a time and avoid any thundering herd.
